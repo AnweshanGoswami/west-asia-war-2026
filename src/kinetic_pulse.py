@@ -11,12 +11,13 @@ API_KEY = os.getenv("NASA_FIRMS_KEY")
 # Bounding box covering Iran, Israel, and surrounding region
 # Format: west, south, east, north
 REGION = "34.0,29.0,60.0,38.0"
+# 34.0 - israel/lebanon coast
+# 29.0 - northern saudi arabia
+# 60.0 - eastern iran
+# 38.0 - northern iran/turkey border
 
 def get_firms_data(days_ago=1):
-    """
-    Fetches thermal anomaly data from NASA FIRMS API.
-    Returns a DataFrame of fire/heat detections in the conflict region.
-    """
+    
     url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{API_KEY}/VIIRS_SNPP_NRT/{REGION}/{days_ago}"
     
     print(f"Fetching NASA FIRMS data for the last {days_ago} day(s)...")
