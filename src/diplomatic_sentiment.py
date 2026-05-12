@@ -13,14 +13,6 @@ from datetime import datetime, timedelta
 warnings.filterwarnings('ignore')
 
 # ── Global Timeout & Retry Strategy ───────────────────────────────────────────
-# Monkey-patches requests.get so gdeltdoc inherits our timeout and retry logic.
-# Without this, failed connections hang indefinitely.
-#
-# timeout=30       → give up if GDELT doesn't respond within 30 seconds
-# total=3          → retry up to 3 times before permanently failing
-# backoff_factor=2 → waits 2s, 4s, 8s between retries (progressive backoff)
-# status_forcelist → auto-retry on server errors and rate limit responses
-
 session = requests.Session()
 
 retry_strategy = Retry(
@@ -34,24 +26,16 @@ session.mount("https://", adapter)
 session.mount("http://", adapter)
 
 original_get = requests.get
-requests.get = lambda *args, **kwargs: original_get(
-    *args, timeout=30, **kwargs
-)
+def safe_get(*args, **kwargs):
+    kwargs.setdefault('timeout', 30) # Only apply if not already specified!
+    return original_get(*args, **kwargs)
+requests.get = safe_get
 
 # ── GPU Detection ──────────────────────────────────────────────────────────────
 device = 0 if torch.cuda.is_available() else -1
 print(f"Using {'GPU' if device == 0 else 'CPU'} for sentiment analysis")
 
 # ── Load DistilBERT ────────────────────────────────────────────────────────────
-# BENCHMARK FINDING (see notebooks/gpu_utilisation_test.ipynb):
-# HuggingFace Dataset prefetching was tested against the sequential batch loop
-# on RTX 3050 Laptop GPU (4GB VRAM). Dataset approach was 0.70x SLOWER
-# (5.02s vs 3.49s for 500 articles). Three reasons:
-#   1. Prefetching overhead outweighs benefits on laptop GPUs
-#   2. DistilBERT (66M params) forward passes are too fast to prefetch around
-#   3. Larger batch_size=64 increased memory transfer overhead on 4GB VRAM
-# Decision: keep sequential batch loop (batch_size=32). Re-benchmark if
-# deployed on server GPU (AWS p3, GCP A100) where results may differ.
 sentiment_model = pipeline(
     "sentiment-analysis",
     model="distilbert-base-uncased-finetuned-sst-2-english",
@@ -59,9 +43,6 @@ sentiment_model = pipeline(
 )
 
 # ── GDELT GKG Theme Codes (verified from GDELT master theme list) ──────────────
-# Meaning-based categories GDELT assigns to every article.
-# Far more robust than keywords — catches any article about these topics
-# regardless of exact wording used by the journalist.
 CONFLICT_THEMES = [
     "ARMEDCONFLICT",      # Any armed conflict coverage
     "ACT_FORCEPOSTURE",   # Military force positioning and posture
@@ -80,27 +61,7 @@ CONFLICT_THEMES = [
 ]
 
 # ── Country × Theme Pairs ──────────────────────────────────────────────────────
-# PREVIOUS APPROACH (naive country query):
-#   We previously queried each country independently e.g. country="YM".
-#   This returned ALL articles published by Yemeni media — including floods,
-#   domestic political crises, famines, and local elections — none of which
-#   are related to the conflict. This is a confounding problem: the sentiment
-#   signal gets contaminated by unrelated domestic events, causing the model
-#   to misinterpret a Yemeni flood (negative sentiment) as conflict escalation.
-#
-# CURRENT APPROACH (country × theme intersection):
-#   We now query country AND theme simultaneously. This returns only articles
-#   from Yemen that GDELT has also classified under a conflict-relevant theme
-#   (e.g. ARMEDCONFLICT, BLOCKADE). The flood and famine articles are
-#   automatically excluded because they don't carry those theme tags.
-#   Each country is only paired with the themes relevant to its specific
-#   role in this conflict — Yemen gets ARMEDCONFLICT and BLOCKADE,
-#   Turkey gets only PEACENEGOTIATION, Saudi Arabia gets only oil/shipping.
-#   This eliminates confounding at the query level rather than trying to
-#   filter it out downstream.
-
 COUNTRY_THEME_PAIRS = [
-    # Direct combatants — military and diplomatic themes
     ("IR", "ARMEDCONFLICT"),
     ("IR", "NUCLEAR"),
     ("IR", "SANCTIONS"),
@@ -111,16 +72,12 @@ COUNTRY_THEME_PAIRS = [
     ("US", "ARMEDCONFLICT"),
     ("US", "PEACENEGOTIATION"),
     ("US", "SANCTIONS"),
-
-    # Proxy actors — only conflict-relevant themes
     ("LE", "ARMEDCONFLICT"),
     ("LE", "TERROR"),
     ("YM", "ARMEDCONFLICT"),
     ("YM", "BLOCKADE"),
     ("IZ", "ARMEDCONFLICT"),
     ("IZ", "ACT_FORCEPOSTURE"),
-
-    # Gulf states — economic and shipping impact only
     ("SA", "ECON_OILPRICE"),
     ("SA", "BLOCKADE"),
     ("AE", "ECON_OILPRICE"),
@@ -128,8 +85,6 @@ COUNTRY_THEME_PAIRS = [
     ("QA", "ECON_OILPRICE"),
     ("KU", "ECON_OILPRICE"),
     ("BA", "ARMEDCONFLICT"),
-
-    # Diplomatic actors — only diplomatic and strategic themes
     ("TU", "PEACENEGOTIATION"),
     ("RS", "ARMEDCONFLICT"),
     ("RS", "SANCTIONS"),
@@ -151,20 +106,12 @@ ECONOMIC_THEMES   = ['ECON_OILPRICE', 'SANCTIONS', 'BLOCKADE']
 
 
 def build_date_range(days_ago):
-    """Returns start and end date strings for the query window."""
     end = datetime.today()
     start = end - timedelta(days=days_ago)
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
 def safe_article_search(gd, f, label):
-    """
-    Wraps gd.article_search with a retry mechanism.
-    First attempt: immediate.
-    On failure: waits 5 seconds and retries once.
-    On second failure: logs and returns None.
-    The global timeout=30 ensures no request hangs indefinitely.
-    """
     try:
         articles = gd.article_search(f)
         return articles
@@ -181,10 +128,6 @@ def safe_article_search(gd, f, label):
 
 
 def safe_timeline_search(gd, f, label):
-    """
-    Wraps gd.timeline_search with a retry mechanism.
-    Same logic as safe_article_search.
-    """
     try:
         tone = gd.timeline_search("timelinetone", f)
         return tone
@@ -201,10 +144,6 @@ def safe_timeline_search(gd, f, label):
 
 
 def fetch_by_themes(days_ago=5):
-    """
-    Fetches articles using verified GDELT GKG theme codes globally.
-    Provides broad conflict coverage regardless of publication country.
-    """
     gd = GdeltDoc()
     start_date, end_date = build_date_range(days_ago)
     all_articles = []
@@ -229,12 +168,6 @@ def fetch_by_themes(days_ago=5):
 
 
 def fetch_by_country_theme_pairs(days_ago=5):
-    """
-    Fetches articles using targeted country × theme combinations.
-    Eliminates confounding from domestic events unrelated to the conflict.
-    Each pair captures only the specific role that country plays
-    in the West Asia conflict.
-    """
     gd = GdeltDoc()
     start_date, end_date = build_date_range(days_ago)
     all_articles = []
@@ -261,12 +194,6 @@ def fetch_by_country_theme_pairs(days_ago=5):
 
 
 def fetch_gdelt_tone_timeline(days_ago=5):
-    """
-    Fetches GDELT's pre-computed tone timeline across ALL conflict themes.
-    Runs one timeline query per theme and averages into a single daily signal.
-    This is our SECOND independent sentiment signal alongside DistilBERT.
-    High divergence between the two = elevated epistemic uncertainty.
-    """
     gd = GdeltDoc()
     start_date, end_date = build_date_range(days_ago)
     all_tones = []
@@ -300,10 +227,6 @@ def fetch_gdelt_tone_timeline(days_ago=5):
 
 
 def merge_and_deduplicate(theme_df, country_theme_df):
-    """
-    Merges global theme results and country×theme results.
-    Removes duplicate articles caught by multiple queries.
-    """
     frames = [df for df in [theme_df, country_theme_df] if df is not None]
     if not frames:
         print("No articles fetched from any source.")
@@ -319,15 +242,6 @@ def merge_and_deduplicate(theme_df, country_theme_df):
 
 
 def score_distilbert_sentiment(df):
-    """
-    Scores article titles using DistilBERT on RTX 3050.
-    Primary sentiment signal. Output: -1.0 (hostile) to +1.0 (diplomatic).
-
-    BENCHMARK FINDING (notebooks/gpu_utilisation_test.ipynb):
-    Sequential batch loop (batch_size=32) outperforms HuggingFace Dataset
-    prefetching on this hardware — 143.1 vs 99.5 articles/sec. See notebook
-    for full analysis. Re-benchmark on server GPU before any cloud deployment.
-    """
     if df is None or len(df) == 0:
         return None
 
@@ -353,30 +267,6 @@ def score_distilbert_sentiment(df):
 
 
 def compute_daily_gmm_weights(df):
-    """
-    Fits a 2-component Gaussian Mixture Model to each day's sentiment scores.
-
-    FINDING (notebooks/distribution_analysis.ipynb):
-    Sentiment scores follow a bimodal distribution — not normal. Three
-    normality tests (Shapiro-Wilk, D'Agostino-Pearson, KS) all rejected
-    normality at p < 0.001. The distribution has two regimes:
-      - Hostile regime:    mean ≈ -0.84, weight ≈ 0.73 (during ceasefire)
-      - Diplomatic regime: mean ≈ +0.76, weight ≈ 0.27 (during ceasefire)
-
-    The hostile regime weight is a more robust conflict signal than the
-    daily mean — especially during ceasefire periods where mean sentiment
-    shifts slowly but regime weights respond faster to diplomatic signals.
-
-    A sustained drop in hostile_weight below 0.50 triggers the diplomatic
-    switch in the Lanchester model — a stronger signal than mean sentiment
-    crossing a threshold.
-
-    Columns produced:
-    - hostile_weight    : fraction of coverage in hostile regime (0 to 1)
-    - diplomatic_weight : fraction of coverage in diplomatic regime (0 to 1)
-    - hostile_mean      : centre of hostile component
-    - diplomatic_mean   : centre of diplomatic component
-    """
     results = []
 
     for date, group in df.groupby('date'):
@@ -396,7 +286,6 @@ def compute_daily_gmm_weights(df):
             gmm = GaussianMixture(n_components=2, random_state=42)
             gmm.fit(day_scores.reshape(-1, 1))
 
-            # Always assign Component 0 as hostile (lower mean)
             idx_hostile    = gmm.means_.argmin()
             idx_diplomatic = 1 - idx_hostile
 
@@ -421,9 +310,6 @@ def compute_daily_gmm_weights(df):
 
 
 def bloc_sentiment(df, countries):
-    """
-    Computes daily mean sentiment for a specific source country bloc.
-    """
     mask = df['query_value'].apply(
         lambda x: any(x.startswith(c + '×') for c in countries)
     )
@@ -434,9 +320,6 @@ def bloc_sentiment(df, countries):
 
 
 def theme_sentiment(df, themes):
-    """
-    Computes daily mean sentiment for a specific theme category.
-    """
     mask = df['query_value'].apply(
         lambda x: any(t in x for t in themes)
     )
@@ -447,56 +330,6 @@ def theme_sentiment(df, themes):
 
 
 def aggregate_daily(df, tone_timeline):
-    """
-    Aggregates article-level scores into a rich daily feature vector.
-
-    INITIAL ASSUMPTION (naive):
-        A single daily mean was used as the sentiment signal, implicitly
-        assuming the underlying score distribution was Gaussian (normal).
-        Under normality, the mean is a sufficient statistic.
-
-    FINDING (notebooks/distribution_analysis.ipynb):
-        Shapiro-Wilk, D'Agostino-Pearson, and KS tests all rejected
-        normality at p < 0.001. The distribution is bimodal — a direct
-        consequence of DistilBERT's binary classification architecture
-        pushing scores toward ±1. Under non-normality, the mean alone
-        is NOT a sufficient estimator.
-
-    CORRECTION:
-        Full distribution statistics, bloc/theme breakdowns, GMM regime
-        weights, and signal divergence now form the daily feature vector.
-
-    Output columns:
-    ┌─ Distribution ──────────────────────────────────────────────────────┐
-    │ distilbert_avg      : mean score (-1 to +1)                         │
-    │ distilbert_median   : median (robust to outliers)                   │
-    │ distilbert_vol      : std deviation                                 │
-    │ distilbert_p10/p90  : tail behaviour                                │
-    │ distilbert_p25/p75  : interquartile range                           │
-    │ distilbert_skew     : asymmetry                                     │
-    │ article_count       : volume of coverage                            │
-    ├─ GMM Regime Weights ────────────────────────────────────────────────┤
-    │ hostile_weight      : fraction of coverage in hostile regime        │
-    │ diplomatic_weight   : fraction of coverage in diplomatic regime     │
-    │ hostile_mean        : centre of hostile component                   │
-    │ diplomatic_mean     : centre of diplomatic component                │
-    ├─ Bloc Breakdown ────────────────────────────────────────────────────┤
-    │ sentiment_adversarial_bloc : Iran/Russia/Yemen/Lebanon/Iraq         │
-    │ sentiment_allied_bloc      : Israel/USA/Bahrain                     │
-    │ sentiment_neutral_bloc     : China/Turkey/Gulf states               │
-    │ bloc_divergence            : adversarial minus allied sentiment     │
-    ├─ Theme Breakdown ───────────────────────────────────────────────────┤
-    │ sentiment_military    : armed conflict/drone/assassination          │
-    │ sentiment_diplomatic  : ceasefire/negotiation                       │
-    │ sentiment_economic    : oil/sanctions/blockade                      │
-    │ military_diplomatic_gap : mil minus diplomatic sentiment            │
-    ├─ Second Signal ─────────────────────────────────────────────────────┤
-    │ gdelt_tone_avg      : GDELT's own tone score (raw)                  │
-    │ gdelt_tone_norm     : GDELT tone normalised to (-1 to +1)           │
-    │ signal_divergence   : |distilbert_avg - gdelt_tone_norm|            │
-    │                       HIGH = elevated epistemic uncertainty         │
-    └─────────────────────────────────────────────────────────────────────┘
-    """
     if df is None:
         return None
 
@@ -504,31 +337,23 @@ def aggregate_daily(df, tone_timeline):
         df['seendate'], format='mixed', errors='coerce'
     ).dt.date
 
-    # ── Core distribution statistics ──────────────────────────────────────────
     daily = df.groupby('date').agg(
         distilbert_avg    =('distilbert_sentiment', 'mean'),
         distilbert_median =('distilbert_sentiment', 'median'),
         distilbert_vol    =('distilbert_sentiment', 'std'),
-        distilbert_p10    =('distilbert_sentiment',
-                            lambda x: x.quantile(0.10)),
-        distilbert_p25    =('distilbert_sentiment',
-                            lambda x: x.quantile(0.25)),
-        distilbert_p75    =('distilbert_sentiment',
-                            lambda x: x.quantile(0.75)),
-        distilbert_p90    =('distilbert_sentiment',
-                            lambda x: x.quantile(0.90)),
-        distilbert_skew   =('distilbert_sentiment',
-                            lambda x: x.skew()),
+        distilbert_p10    =('distilbert_sentiment', lambda x: x.quantile(0.10)),
+        distilbert_p25    =('distilbert_sentiment', lambda x: x.quantile(0.25)),
+        distilbert_p75    =('distilbert_sentiment', lambda x: x.quantile(0.75)),
+        distilbert_p90    =('distilbert_sentiment', lambda x: x.quantile(0.90)),
+        distilbert_skew   =('distilbert_sentiment', lambda x: x.skew()),
         article_count     =('distilbert_sentiment', 'count'),
     ).reset_index()
 
-    # ── GMM regime weights ─────────────────────────────────────────────────────
     print("\nFitting daily GMM regime weights...")
     gmm_df = compute_daily_gmm_weights(df)
     daily  = daily.merge(gmm_df, on='date', how='left')
     print("GMM weights computed.")
 
-    # ── Sentiment by source bloc ───────────────────────────────────────────────
     adv  = bloc_sentiment(df, ADVERSARIAL_COUNTRIES)
     ally = bloc_sentiment(df, ALLIED_COUNTRIES)
     neut = bloc_sentiment(df, NEUTRAL_COUNTRIES)
@@ -549,7 +374,6 @@ def aggregate_daily(df, tone_timeline):
             daily['sentiment_allied_bloc']
         )
 
-    # ── Sentiment by theme category ────────────────────────────────────────────
     mil  = theme_sentiment(df, MILITARY_THEMES)
     dip  = theme_sentiment(df, DIPLOMATIC_THEMES)
     econ = theme_sentiment(df, ECONOMIC_THEMES)
@@ -570,7 +394,6 @@ def aggregate_daily(df, tone_timeline):
             daily['sentiment_diplomatic']
         )
 
-    # ── GDELT tone timeline (second independent signal) ────────────────────────
     if tone_timeline is not None and len(tone_timeline) > 0:
         try:
             tone_timeline['date'] = pd.to_datetime(
@@ -607,26 +430,57 @@ def aggregate_daily(df, tone_timeline):
     return daily
 
 
+def run_realtime():
+    """
+    Standardized entry point for the master polling loop.
+    Runs the 6-step sentiment pipeline for the latest 24 hours.
+    """
+    print("Running real-time diplomatic sentiment analysis...")
+    try:
+        # Polling window: 1 day to ensure it runs quickly but catches new articles
+        DAYS = 1 
+        
+        # 1. Fetch articles
+        theme_df         = fetch_by_themes(days_ago=DAYS)
+        country_theme_df = fetch_by_country_theme_pairs(days_ago=DAYS)
+
+        # 2. Fetch Tone timeline
+        tone_tl = fetch_gdelt_tone_timeline(days_ago=DAYS)
+
+        # 3. Merge
+        combined_df = merge_and_deduplicate(theme_df, country_theme_df)
+
+        # 4. Score DistilBERT
+        scored_df = score_distilbert_sentiment(combined_df)
+
+        # 5. Aggregate Daily stats (GMM, blocs, themes)
+        daily_df = aggregate_daily(scored_df, tone_tl)
+
+        # 6. Save receipt
+        if daily_df is not None and not daily_df.empty:
+            save_path = "data/sentiment_realtime.csv"
+            daily_df.to_csv(save_path, index=False)
+            return {"status": "success", "records": len(daily_df), "file": save_path}
+        
+        return {"status": "empty", "records": 0}
+        
+    except Exception as e:
+        print(f"Error during sentiment realtime poll: {e}")
+        return {"status": "failed", "records": 0}
+
+
 if __name__ == "__main__":
+    # Standard 5-day historical run for manual script execution
     DAYS = 5
 
-    # Step 1: Fetch articles from all sources
     theme_df         = fetch_by_themes(days_ago=DAYS)
     country_theme_df = fetch_by_country_theme_pairs(days_ago=DAYS)
-
-    # Step 2: Fetch GDELT tone timeline across all themes
-    tone_tl = fetch_gdelt_tone_timeline(days_ago=DAYS)
-
-    # Step 3: Merge and deduplicate
+    tone_tl          = fetch_gdelt_tone_timeline(days_ago=DAYS)
+    
     combined_df = merge_and_deduplicate(theme_df, country_theme_df)
+    scored_df   = score_distilbert_sentiment(combined_df)
+    daily_df    = aggregate_daily(scored_df, tone_tl)
 
-    # Step 4: Score with DistilBERT
-    scored_df = score_distilbert_sentiment(combined_df)
-
-    # Step 5: Aggregate to daily with full feature vector
-    daily_df = aggregate_daily(scored_df, tone_tl)
-
-    # Step 6: Save outputs
     if scored_df is not None:
         scored_df.to_csv("data/gdelt_raw.csv", index=False)
         print("\nRaw articles saved to data/gdelt_raw.csv")

@@ -71,6 +71,32 @@ def handle_market_closures(df):
     print(f"Filled market closures: expanded from {len(df)} to {len(df_complete)} days.")
     return df_complete
 
+def run_realtime():
+    """
+    Standardized entry point for the master polling loop.
+    Fetches the latest economic data, forward-fills market closures,
+    and updates the live CSV.
+    """
+    print("Running real-time economic signals update...")
+    try:
+        raw_df = fetch_economic_data()
+        
+        if raw_df is not None and not raw_df.empty:
+            processed_df = handle_market_closures(raw_df)
+            
+            # Save to data folder as a live update file
+            os.makedirs('data', exist_ok=True)
+            save_path = "data/economic_realtime.csv"
+            processed_df.to_csv(save_path, index=False)
+            
+            return {"status": "success", "records": len(processed_df), "file": save_path}
+            
+        return {"status": "empty", "records": 0}
+        
+    except Exception as e:
+        print(f"Error fetching economic signals: {e}")
+        return {"status": "failed", "records": 0}
+
 if __name__ == "__main__":
     # 1. Fetch raw data
     raw_df = fetch_economic_data()
