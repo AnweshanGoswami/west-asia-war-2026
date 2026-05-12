@@ -1,0 +1,33 @@
+{
+  "date": "2026-02-03",
+  "data_type": "historical_reconstruction",
+  "generated_at": "2026-05-12T09:23:01.457964+00:00",
+  "sentiment": {
+    "distilbert_avg": null,
+    "hostile_weight": null,
+    "diplomatic_weight": null,
+    "signal_divergence": null
+  },
+  "kinetic": {
+    "frp_mean": null,
+    "anomaly_count": null,
+    "shock_detected": false,
+    "gdelt_events": 1028
+  },
+  "economic": {
+    "brent_crude_change": 1.029998779296875,
+    "vix_change": 1.6599998474121094,
+    "usd_ils_change": 0.010160207748412642,
+    "gold_change": 281.2001953125
+  },
+  "model_output": {
+    "ceasefire_probability": null,
+    "escalation_probability": null,
+    "stalemate_probability": null,
+    "capitulation_probability": null
+  },
+  "confidence_interval": {
+    "lower_95": null,
+    "upper_95": null
+  }
+}
