@@ -142,8 +142,8 @@ ECONOMIC_THEMES       = ['ECON_OILPRICE', 'SANCTIONS', 'BLOCKADE']
 
 # ── Rate limit: max concurrent GDELT requests ─────────────────────────────────
 # Do NOT increase beyond 3 — GDELT will rate-limit or ban the IP
-MAX_WORKERS  = 3
-API_DELAY    = 1.0   # seconds between calls within a thread
+MAX_WORKERS  = 1
+API_DELAY    = 5.0   # seconds between calls within a thread
 
 
 # ── Fetch helpers ──────────────────────────────────────────────────────────────
@@ -155,51 +155,61 @@ def build_date_range(days_ago):
 
 
 def _fetch_articles_single(query_type, label, filters_kwargs,
-                            start_date, end_date) -> pd.DataFrame | None:
+                           start_date, end_date) -> pd.DataFrame | None:
     """
     Fetch articles for a single theme or country×theme pair.
-    Thread-safe — uses thread-local GdeltDoc instance.
+    Uses aggressive exponential backoff (5 attempts) to protect historical data.
     """
     gd = _get_gdelt_client()
     f  = Filters(start_date=start_date, end_date=end_date,
                  num_records=250, **filters_kwargs)
-    for attempt in range(2):
+                 
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             articles = gd.article_search(f)
             if articles is not None and len(articles) > 0:
                 articles['query_type']  = query_type
                 articles['query_value'] = label
                 return articles
-            return None
+            return None # Successful query, but genuinely 0 articles
+            
         except Exception as e:
-            if attempt == 0:
-                print(f"  '{label}' failed, retrying in 5s... ({e})")
-                time.sleep(5)
+            if attempt < max_attempts - 1:
+                # Exponential backoff: 5s, 10s, 20s, 40s...
+                wait_time = 5 * (2 ** attempt) 
+                print(f"  '{label}' failed, retrying in {wait_time}s... ({e})")
+                time.sleep(wait_time)
             else:
-                print(f"  '{label}' permanently failed: {e}")
+                print(f"  '{label}' PERMANENTLY FAILED after {max_attempts} attempts: {e}")
+                # TODO: In a hyper-strict environment, you would log this specific 
+                # query to a 'failed_queries.txt' file to manually rerun later.
                 return None
     return None
 
 
 def _fetch_tone_single(theme, start_date, end_date) -> pd.DataFrame | None:
-    """Fetch tone timeline for a single theme. Thread-safe."""
+    """Fetch tone timeline with aggressive exponential backoff."""
     gd = _get_gdelt_client()
     f  = Filters(theme=theme, start_date=start_date, end_date=end_date)
-    for attempt in range(2):
+    
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
             tone = gd.timeline_search("timelinetone", f)
             if tone is not None and len(tone) > 0:
                 tone['theme'] = theme
                 return tone
             return None
+            
         except Exception as e:
-            if attempt == 0:
-                time.sleep(5)
+            if attempt < max_attempts - 1:
+                wait_time = 5 * (2 ** attempt)
+                time.sleep(wait_time)
             else:
-                print(f"  Tone '{theme}' permanently failed: {e}")
+                print(f"  Tone '{theme}' PERMANENTLY FAILED after {max_attempts} attempts: {e}")
                 return None
     return None
-
 
 def fetch_all_articles(start_date: str, end_date: str) -> pd.DataFrame | None:
     """
