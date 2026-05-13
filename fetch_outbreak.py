@@ -3,7 +3,6 @@ import requests
 import time
 from src.diplomatic_sentiment import (
     score_distilbert_sentiment,
-    compute_daily_gmm_weights,
     aggregate_daily
 )
 
@@ -48,17 +47,21 @@ for current_date in target_dates:
         df = fetch_raw_gdelt(f"theme:{theme}", date_clean)
         if not df.empty:
             df['date'] = current_date
+            df['query_type'] = 'theme'                # <-- ADDED MISSING VARIABLE
+            df['query_value'] = theme                 # <-- ADDED MISSING VARIABLE
             master_articles.append(df)
             print(f" ✓ Got {len(df)} articles")
         else:
             print(" X")
-        time.sleep(5) # Give the server room to breathe
+        time.sleep(5)
 
     for country in COUNTRIES:
         print(f"  -> Pulling {country}xConflict...", end="", flush=True)
         df = fetch_raw_gdelt(f"sourcecountry:{country} theme:ARMEDCONFLICT", date_clean)
         if not df.empty:
             df['date'] = current_date
+            df['query_type'] = 'country_theme'              # <-- ADDED MISSING VARIABLE
+            df['query_value'] = f"{country}×ARMEDCONFLICT"  # <-- ADDED MISSING VARIABLE
             master_articles.append(df)
             print(f" ✓ Got {len(df)} articles")
         else:
@@ -66,17 +69,19 @@ for current_date in target_dates:
         time.sleep(5)
 
 if not master_articles:
-    print("\n[!] GDELT is likely fully offline or your machine is blocking outgoing HTTPS.")
+    print("\n[!] GDELT is offline.")
     exit()
 
-# Combine, deduplicate, and apply the critical 'seendate' fix
+# Combine and deduplicate
 df_articles = pd.concat(master_articles, ignore_index=True).drop_duplicates(subset=['url'])
-df_articles['seendate'] = df_articles['date']
+# Bulletproof fallback for seendate
+df_articles['seendate'] = df_articles['date'] 
 print(f"\nSuccess! Total articles for outbreak: {len(df_articles)}")
 
 # NLP Processing
 df_scored = score_distilbert_sentiment(df_articles)
-df_scored = compute_daily_gmm_weights(df_scored)
+
+# FINAL AGGREGATION (GMM and Bloc tracking are handled automatically inside here)
 tone_mock = pd.DataFrame({'date': ['2026-02-28', '2026-03-01'], 'gdelt_tone_avg': [-3.5, -3.5]})
 df_daily = aggregate_daily(df_scored, tone_mock)
 

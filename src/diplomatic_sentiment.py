@@ -402,9 +402,12 @@ def aggregate_daily(df, tone_timeline):
     if df is None:
         return None
 
-    df['date'] = pd.to_datetime(
-        df['seendate'], format='mixed', errors='coerce').dt.date
-
+    # --- THE FIX: Handle both 'seendate' (from gdeltdoc) and 'date' (from raw fetcher) ---
+    if 'seendate' in df.columns:
+        df['date'] = pd.to_datetime(df['seendate'], format='mixed', errors='coerce').dt.date
+    else:
+        # If 'seendate' isn't there, we just ensure 'date' is a datetime object
+        df['date'] = pd.to_datetime(df['date'], errors='coerce').dt.date
     daily = df.groupby('date').agg(
         distilbert_avg    =('distilbert_sentiment', 'mean'),
         distilbert_median =('distilbert_sentiment', 'median'),
