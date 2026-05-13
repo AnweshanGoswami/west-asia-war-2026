@@ -190,8 +190,21 @@ def _load_economic() -> pd.DataFrame:
 
     df = pd.read_csv(ECONOMIC_CSV)
     df["date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-    df = df.drop(columns=["Date"], errors="ignore").sort_values("date").reset_index(drop=True)
+    df = df.drop(columns=["Date"], errors="ignore").sort_values("date")
+    
+    # --- FIX: Weekend Forward-Fill ---
+    # Reindex to a continuous daily frequency to expose weekend gaps
+    df.set_index("date", inplace=True)
+    all_days = pd.date_range(start=df.index.min(), end=df.index.max(), freq="D").date
+    df = df.reindex(all_days)
+    
+    # Forward-fill prices (Friday's close carries through the weekend)
+    df = df.ffill()
+    df.index.name = "date"
+    df = df.reset_index()
 
+    # NOW calculate the daily differences. 
+    # Saturday/Sunday diffs will be 0. Monday diff will be (Monday - Friday).
     for col, out_col in [("Brent_Crude", "brent_crude_change"), ("VIX", "vix_change"),
                          ("USD_ILS", "usd_ils_change"), ("Gold", "gold_change")]:
         if col in df.columns:
@@ -207,7 +220,7 @@ def _load_economic() -> pd.DataFrame:
             df["sp500_drawdown_pct"] = None
         df = df.drop(columns=["SP500"], errors="ignore")
 
-    log.info("Economic loaded: %d days", len(df))
+    log.info("Economic loaded and forward-filled: %d days", len(df))
     return df
 
 
@@ -218,6 +231,17 @@ def _load_sentiment() -> pd.DataFrame:
     df = pd.read_csv(SENTIMENT_CSV)
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
 
+    # --- FIX: Handle Duplicates by Maximum Data Availability ---
+    # Count how many non-null values exist in each row
+    df['valid_data_count'] = df.notna().sum(axis=1)
+    
+    # Sort by date, and then by data count (descending) so the richest row is first
+    df = df.sort_values(by=['date', 'valid_data_count'], ascending=[True, False])
+    
+    # Drop duplicates, keeping that first (richest) row
+    df = df.drop_duplicates(subset=['date'], keep='first')
+    df = df.drop(columns=['valid_data_count'])
+
     keep = ["date", "distilbert_avg", "distilbert_vol", "article_count", "hostile_weight", 
             "diplomatic_weight", "hostile_mean", "diplomatic_mean", "sentiment_adversarial_bloc", 
             "sentiment_allied_bloc", "sentiment_neutral_bloc", "bloc_divergence", 
@@ -225,7 +249,7 @@ def _load_sentiment() -> pd.DataFrame:
             "military_diplomatic_gap", "gdelt_tone_avg", "gdelt_tone_norm", "signal_divergence"]
     df = df[[c for c in keep if c in df.columns]]
 
-    log.info("Sentiment loaded: %d days", len(df))
+    log.info("Sentiment loaded and deduplicated: %d days", len(df))
     return df
 
 

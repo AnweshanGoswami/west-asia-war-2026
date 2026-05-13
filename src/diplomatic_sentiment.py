@@ -570,7 +570,7 @@ def run_historical(start_date: str = "2026-02-01",
         try:
             # fetch_tone=False — saves 14 calls per chunk in historical mode
             daily_df = _run_pipeline(chunk_start_str, chunk_end_str,
-                                     fetch_tone=True)
+                                     fetch_tone=False)
             if daily_df is not None and not daily_df.empty:
                 write_header = not os.path.exists(save_path)
                 daily_df.to_csv(save_path, mode="a",
@@ -589,7 +589,8 @@ def run_historical(start_date: str = "2026-02-01",
 
 
 if __name__ == "__main__":
-    DAYS = 5
+    # Set to 1 day for a quick, safe test. Use run_historical() for big pulls.
+    DAYS = 1 
     end_date   = datetime.today().strftime("%Y-%m-%d")
     start_date = (datetime.today() - timedelta(days=DAYS)).strftime("%Y-%m-%d")
 
@@ -597,5 +598,11 @@ if __name__ == "__main__":
 
     if daily_df is not None:
         os.makedirs('data', exist_ok=True)
-        daily_df.to_csv("data/gdelt_sentiment_daily.csv", index=False)
-        print("\nSaved to data/gdelt_sentiment_daily.csv")
+        save_path = "data/gdelt_sentiment_daily.csv"
+        
+        # THE FIX: Check if file exists so we don't duplicate headers
+        write_header = not os.path.exists(save_path)
+        
+        # THE FIX: mode="a" appends data instead of destroying the file
+        daily_df.to_csv(save_path, mode="a", header=write_header, index=False)
+        print(f"\nSafely appended to {save_path}")
