@@ -2,8 +2,9 @@
 src/firms_compiler.py
 ────────────────────────────────────────────────────────────────────────────────
 NASA FIRMS Staging Compiler
-Merges MODIS legacy, VIIRS Archive, and VIIRS NRT into single physical layer.
-Resolves column mismatches. Filters strictly to Feb 01 2026+.
+Merges MODIS legacy, VIIRS Archive, and VIIRS NRT into a single physical layer.
+Resolves column mismatches and compiles unified brightness and background channels.
+Filters strictly to Feb 01 2026+.
 """
 import pandas as pd
 from pathlib import Path
@@ -13,9 +14,9 @@ DATA_DIR = Path("data")
 def compile_firms_data():
     print("Compiling NASA FIRMS raw files...")
 
-    modis_path        = DATA_DIR / "firms_raw.csv"
+    modis_path         = DATA_DIR / "firms_raw.csv"
     viirs_archive_path = DATA_DIR / "fire_archive_SV-C2_749347.csv"
-    viirs_nrt_path    = DATA_DIR / "fire_nrt_SV-C2_749347.csv"
+    viirs_nrt_path     = DATA_DIR / "fire_nrt_SV-C2_749347.csv"
 
     dfs = []
 
@@ -42,19 +43,28 @@ def compile_firms_data():
     raw_df["date"] = pd.to_datetime(raw_df[date_col], errors="coerce").dt.date
     raw_df = raw_df.dropna(subset=["latitude", "longitude", "date"])
 
-    # 2. Hard filter — Feb 01 2026 is the timeline anchor, January noise OUT
+    # 2. Hard filter — Feb 01 2026 is the timeline anchor
     raw_df = raw_df[pd.to_datetime(raw_df["date"]) >= pd.Timestamp("2026-02-01")]
 
     # 3. Resolve NASA column mismatch
-    #    MODIS → 'brightness' (M-Band, ~4.0µm fire channel)
-    #    VIIRS → 'bright_ti4' (I-Band, ~4.0µm fire channel)
-    #    unified_brightness = VIIRS preferred, MODIS fallback
+    
+    # A. The Primary Fire Channel (~4.0 µm) -> Peak Explosion Temp
     if "bright_ti4" in raw_df.columns and "brightness" in raw_df.columns:
         raw_df["unified_brightness"] = raw_df["bright_ti4"].combine_first(raw_df["brightness"])
     elif "brightness" in raw_df.columns:
         raw_df["unified_brightness"] = raw_df["brightness"]
     else:
-        raw_df["unified_brightness"] = raw_df["bright_ti4"]
+        raw_df["unified_brightness"] = raw_df.get("bright_ti4")
+
+    # B. The Background Channel (~11.0 µm) -> Ambient Desert Temp for Cross-Verification
+    if "bright_ti5" in raw_df.columns and "bright_t31" in raw_df.columns:
+        raw_df["unified_background"] = raw_df["bright_ti5"].combine_first(raw_df["bright_t31"])
+    elif "bright_t31" in raw_df.columns:
+        raw_df["unified_background"] = raw_df["bright_t31"]
+    elif "bright_ti5" in raw_df.columns:
+        raw_df["unified_background"] = raw_df["bright_ti5"]
+    else:
+        raw_df["unified_background"] = None
 
     # 4. Drop legacy/redundant columns
     cols_to_drop = ["bright_ti4", "bright_ti5", "bright_t31", "brightness", "acq_date", "acq_time"]
@@ -73,8 +83,6 @@ def compile_firms_data():
 
     print(f"\n✓ Compilation successful.")
     print(f"  Unique anomalies (Feb 01 2026+): {len(raw_df)}")
-    print(f"  Source breakdown:\n{raw_df['source_file'].value_counts().to_string()}")
-    print(f"  Date range: {raw_df['date'].min()} → {raw_df['date'].max()}")
     print(f"  Saved → {out_path}")
 
 if __name__ == "__main__":

@@ -39,6 +39,8 @@ def run_normalization():
     
     transformed_df[nan_mask] = np.nan
     df[features_to_scale] = transformed_df
+    # NEW: Clip out-of-distribution values to [0,1] for ODE compatibility
+    df[features_to_scale] = df[features_to_scale].clip(lower=0, upper=1)
     
     SCALER_PATH.parent.mkdir(parents=True, exist_ok=True)
     with open(SCALER_PATH, "wb") as f:

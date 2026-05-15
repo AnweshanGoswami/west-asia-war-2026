@@ -30,6 +30,8 @@ def detect_shocks():
     
     # Floor magnitude at 0 (we do not care about highly diplomatic/cooperative events here)
     df.loc[df['shock_magnitude'] < 0, 'shock_magnitude'] = 0
+    # NEW: Zero out magnitude when shock not detected (prevent false positives)
+    df.loc[df['kinetic_shock'] == False, 'shock_magnitude'] = 0
     
     shocks_detected = df['kinetic_shock'].sum()
     
