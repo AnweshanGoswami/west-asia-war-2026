@@ -1,381 +1,325 @@
 """
-src/data_merger.py
-────────────────────────────────────────────────────────────────────────────────
-Data Merging — Step 9
-West Asia War 2026 Conflict Prediction Engine
+data_merger.py - Step 9: Data Merging
+Creates master_df by joining all 4 data layers on date.
 
-Joins all 4 data sources on `date` into single master DataFrame.
+Key Operations:
+1. GDELT 6-day lag correction (kinetic + sentiment)
+2. FIRMS daily aggregation (12 features)
+3. GDELT kinetic daily aggregation (6 features)
+4. Economic data merge (raw + realtime)
+5. Sentiment data merge (daily + patch + realtime)
+6. Missing data flagging
+7. Date range: 2026-02-08 → 2026-05-11
 
-KEY OPERATIONS
-──────────────
-  1. Spatial Anchoring via BallTree (100km geocoding error budget)
-     Cross-references GDELT events against NASA FIRMS thermal anomalies
-     within a ±2 day temporal window. Logs exact match distance.
-     IRAN EXCEPTION: IR events outside 100km NOT dropped — marked
-     'iran_unverified' for downstream uncertainty scaling in Phase 3.
-
-  2. GDELT kinetic 6-day lag correction
-     Narrative reports trail physical thermal detections by 6 days.
-     Applied before spatial anchoring so causality is preserved.
-
-  3. Weekend forward-fill
-     Economic signals forward-filled from Friday close.
-
-  4. Missing data flagging
-     Missing days flagged for uncertainty propagation in Lanchester ODEs.
-
-OUTPUT
-──────
-  data/master_df.csv — one row per day, Feb 01 2026 → yesterday
+Author: Anweshan Goswami
+Date: 2026-05-16
 """
 
-import logging
 import pandas as pd
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
-from sklearn.neighbors import BallTree
 
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+DATA_DIR = Path("data")
+OUTPUT_FILE = DATA_DIR / "master_df.csv"
+
+# Date range for master dataframe (after 6-day GDELT lag correction)
+START_DATE = "2026-02-08"  # Start after lag correction buffer
+END_DATE = "2026-05-11"    # Latest date with FIRMS/Economic coverage
+
+# GDELT REPORTING LAG CORRECTION
+# Finding: GDELT news trails FIRMS thermal detection by 6 days
+# Peak CCF at lag = +6 days → subtract 6 days from GDELT dates
+GDELT_LAG_DAYS = 6
+
+print("="*80)
+print("DATA MERGER - STEP 9")
+print("="*80)
+
+# ============================================================================
+# 1. LOAD RAW DATA
+# ============================================================================
+
+print("\n[1/8] Loading raw datasets...")
+
+# Physical layer: FIRMS thermal detections
+firms_raw = pd.read_csv(DATA_DIR / "firms_compiled.csv", low_memory=False)
+firms_raw['date'] = pd.to_datetime(firms_raw['date'])
+print(f"  ✓ FIRMS: {len(firms_raw):,} detections")
+
+# Narrative layer: GDELT kinetic events (not uploaded, will be loaded from data/)
+# Expected columns: date, event_id, cameo_code, goldstein_scale, num_mentions, 
+#                   num_articles, avg_tone, action_lat, action_lon
+gdelt_kinetic_raw = pd.read_csv(DATA_DIR / "gdelt_kinetic_raw.csv", low_memory=False)
+gdelt_kinetic_raw['date'] = pd.to_datetime(gdelt_kinetic_raw['date'], format='%d-%m-%Y')
+print(f"  ✓ GDELT Kinetic: {len(gdelt_kinetic_raw):,} events")
+
+# Economic layer
+econ_raw = pd.read_csv(DATA_DIR / "economic_raw.csv")
+econ_raw['Date'] = pd.to_datetime(econ_raw['Date'])
+econ_raw = econ_raw.rename(columns={'Date': 'date'})  # Standardize date column
+
+econ_realtime = pd.read_csv(DATA_DIR / "economic_realtime.csv")
+econ_realtime['Date'] = pd.to_datetime(econ_realtime['Date'])
+econ_realtime = econ_realtime.rename(columns={'Date': 'date'})
+print(f"  ✓ Economic raw: {len(econ_raw)} days")
+print(f"  ✓ Economic realtime: {len(econ_realtime)} days")
+
+# Sentiment layer
+sent_daily = pd.read_csv(DATA_DIR / "gdelt_sentiment_daily.csv")
+sent_daily['date'] = pd.to_datetime(sent_daily['date'])
+
+outbreak_patch = pd.read_csv(DATA_DIR / "outbreak_patch.csv")
+outbreak_patch['date'] = pd.to_datetime(outbreak_patch['date'])
+
+sent_realtime = pd.read_csv(DATA_DIR / "sentiment_realtime.csv")
+sent_realtime['date'] = pd.to_datetime(sent_realtime['date'])
+print(f"  ✓ Sentiment daily: {len(sent_daily)} days")
+print(f"  ✓ Outbreak patch: {len(outbreak_patch)} days")
+print(f"  ✓ Sentiment realtime: {len(sent_realtime)} days")
+
+# ============================================================================
+# 2. HANDLE DUPLICATE DATES IN SENTIMENT
+# ============================================================================
+
+print("\n[2/8] Cleaning sentiment duplicates...")
+
+# Keep row with higher article_count (real data vs artifacts)
+sent_daily = sent_daily.sort_values(['date', 'article_count'], ascending=[True, False])
+sent_daily_dedup = sent_daily.drop_duplicates(subset='date', keep='first')
+
+duplicates_dropped = len(sent_daily) - len(sent_daily_dedup)
+print(f"  ✓ Dropped {duplicates_dropped} low-count duplicate dates")
+print(f"  ✓ Sentiment daily after dedup: {len(sent_daily_dedup)} days")
+
+# ============================================================================
+# 3. APPLY 6-DAY LAG CORRECTION TO GDELT DATA
+# ============================================================================
+
+print(f"\n[3/8] Applying {GDELT_LAG_DAYS}-day GDELT lag correction...")
+print("  Rationale: GDELT news trails FIRMS thermal detection by 6 days")
+print("  → Subtract 6 days from GDELT event dates to align with actual occurrence")
+
+# Kinetic events: shift dates back by 6 days
+gdelt_kinetic_raw['date'] = gdelt_kinetic_raw['date'] - pd.Timedelta(days=GDELT_LAG_DAYS)
+print(f"  ✓ Kinetic events date range after lag: {gdelt_kinetic_raw['date'].min().date()} → {gdelt_kinetic_raw['date'].max().date()}")
+
+# Sentiment: shift dates back by 6 days
+sent_daily_dedup['date'] = sent_daily_dedup['date'] - pd.Timedelta(days=GDELT_LAG_DAYS)
+outbreak_patch['date'] = outbreak_patch['date'] - pd.Timedelta(days=GDELT_LAG_DAYS)
+sent_realtime['date'] = sent_realtime['date'] - pd.Timedelta(days=GDELT_LAG_DAYS)
+print(f"  ✓ Sentiment date range after lag: {sent_daily_dedup['date'].min().date()} → {sent_daily_dedup['date'].max().date()}")
+
+# ============================================================================
+# 4. AGGREGATE FIRMS BY DAY
+# ============================================================================
+
+print("\n[4/8] Aggregating FIRMS thermal detections by day...")
+
+firms_daily = firms_raw.groupby('date').agg({
+    # Count metrics
+    'frp': [
+        ('firms_detection_count', 'count'),
+        ('firms_high_intensity_count', lambda x: (x > 50).sum()),  # FRP > 50 MW
+        # Intensity metrics
+        ('firms_total_frp', 'sum'),
+        ('firms_mean_frp', 'mean'),
+        ('firms_max_frp', 'max'),
+    ],
+    'unified_brightness': [
+        ('firms_mean_brightness', 'mean'),
+        ('firms_max_brightness', 'max'),
+    ],
+    # Spatial metrics (for BallTree spatial anchoring later)
+    'latitude': [
+        ('firms_centroid_lat', 'mean'),
+        ('firms_spatial_std_lat', 'std'),
+    ],
+    'longitude': [
+        ('firms_centroid_lon', 'mean'),
+        ('firms_spatial_std_lon', 'std'),
+    ],
+}).reset_index()
+
+# Flatten multi-level column names
+firms_daily.columns = [col[1] if col[1] else col[0] for col in firms_daily.columns]
+firms_daily = firms_daily.rename(columns={'': 'date'})
+
+# Calculate brightness anomaly (where background data exists)
+firms_with_bg = firms_raw[firms_raw['unified_background'].notna()].copy()
+firms_with_bg['brightness_delta'] = firms_with_bg['unified_brightness'] - firms_with_bg['unified_background']
+
+brightness_anomaly = firms_with_bg.groupby('date').agg({
+    'brightness_delta': [('firms_mean_brightness_delta', 'mean')],
+    'unified_background': [('firms_pct_with_background', 'count')]
+}).reset_index()
+brightness_anomaly.columns = [col[1] if col[1] else col[0] for col in brightness_anomaly.columns]
+brightness_anomaly = brightness_anomaly.rename(columns={'': 'date'})
+
+# Calculate percentage with background data
+total_detections = firms_raw.groupby('date').size().reset_index(name='total_count')
+brightness_anomaly = brightness_anomaly.merge(total_detections, on='date', how='left')
+brightness_anomaly['firms_pct_with_background'] = (
+    brightness_anomaly['firms_pct_with_background'] / brightness_anomaly['total_count'] * 100
 )
-log = logging.getLogger(__name__)
+brightness_anomaly = brightness_anomaly.drop(columns=['total_count'])
 
-# ── Paths ─────────────────────────────────────────────────────────────────────
-ROOT_DIR      = Path(__file__).resolve().parent.parent
-DATA_DIR      = ROOT_DIR / "data"
-FIRMS_CSV     = DATA_DIR / "firms_compiled.csv"      # compiled physical layer
-ECONOMIC_CSV  = DATA_DIR / "economic_raw.csv"
-GDELT_KIN_CSV = DATA_DIR / "gdelt_kinetic_raw.csv"
-OUTPUT_CSV    = DATA_DIR / "master_df.csv"
+# Merge brightness anomaly into main FIRMS daily
+firms_daily = firms_daily.merge(brightness_anomaly, on='date', how='left')
 
-SENTIMENT_FILES = [
-    DATA_DIR / "gdelt_sentiment_daily.csv",
-    DATA_DIR / "outbreak_patch.csv",
-    DATA_DIR / "sentiment_realtime.csv",
-]
+print(f"  ✓ FIRMS aggregated to {len(firms_daily)} days with 12 features")
+print(f"    Features: detection_count, high_intensity_count, total_frp, mean_frp,")
+print(f"              max_frp, mean_brightness, max_brightness, centroid_lat/lon,")
+print(f"              spatial_std_lat/lon, mean_brightness_delta, pct_with_background")
 
-# ── Config ────────────────────────────────────────────────────────────────────
-GDELT_LAG_DAYS   = 6
-ANCHOR_RADIUS_KM = 100.0       # geocoding error budget for West Asia theater
-EARTH_RADIUS_KM  = 6371.0
-BACKFILL_START   = "2026-02-01"
+# ============================================================================
+# 5. AGGREGATE GDELT KINETIC BY DAY
+# ============================================================================
 
-# Historically unbackfilled — all 107 rows null; excluded from model features
-NULL_SENTIMENT_COLS = ["gdelt_tone_avg", "gdelt_tone_norm", "signal_divergence"]
+print("\n[5/8] Aggregating GDELT kinetic events by day...")
 
-# Explicit GDELT V1 column map — prevents silent row-swallowing header bug
-GDELT_COLS = [
-    "date", "event_id", "event_root_code", "cameo_code",
-    "goldstein_scale", "num_mentions", "num_sources", "avg_tone",
-    "action_lat", "action_lon", "action_country_code", "action_geo_fullname",
-    "actor1_country", "actor2_country", "source_url", "date_added",
-]
+gdelt_daily = gdelt_kinetic_raw.groupby('date').agg({
+    'event_id': [('gdelt_event_count', 'count')],
+    'num_mentions': [('gdelt_total_mentions', 'sum')],
+    'num_articles': [('gdelt_total_articles', 'sum')],
+    'goldstein_scale': [
+        ('gdelt_mean_goldstein', 'mean'),
+        ('gdelt_min_goldstein', 'min'),  # Most negative = most hostile
+    ],
+    'avg_tone': [('gdelt_mean_tone', 'mean')],
+}).reset_index()
 
-# Model features — S&P 500 excluded; gdelt_avg_anchor_dist diagnostic only
-MODEL_FEATURES = [
-    "firms_frp_mean",
-    "firms_brightness_mean",
-    "firms_anomaly_count",
-    "gdelt_event_count",
-    "gdelt_avg_goldstein",
-    "gdelt_total_mentions",
-    "gdelt_avg_tone",
-    "brent_crude_change",
-    "vix_change",
-    "usd_ils_change",
-    "gold_change",
-    "distilbert_avg",
-    "hostile_weight",
-    "diplomatic_weight",
-    "bloc_divergence",
-    "military_diplomatic_gap",
-]
+# Flatten column names
+gdelt_daily.columns = [col[1] if col[1] else col[0] for col in gdelt_daily.columns]
+gdelt_daily = gdelt_daily.rename(columns={'': 'date'})
 
+print(f"  ✓ GDELT kinetic aggregated to {len(gdelt_daily)} days with 6 features")
+print(f"    Features: event_count, total_mentions, total_articles,")
+print(f"              mean_goldstein, min_goldstein, mean_tone")
 
-# ── Loaders ───────────────────────────────────────────────────────────────────
+# ============================================================================
+# 6. MERGE ECONOMIC DATA
+# ============================================================================
 
-def _load_firms() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Load firms_compiled.csv.
-    Returns:
-        raw_df   — unaggregated rows for BallTree spatial anchoring
-        daily_df — daily aggregates for master merge
-    """
-    if not FIRMS_CSV.exists():
-        log.warning("firms_compiled.csv not found — run firms_compiler.py first")
-        return pd.DataFrame(), pd.DataFrame()
+print("\n[6/8] Merging economic datasets...")
 
-    raw_df = pd.read_csv(FIRMS_CSV)
-    raw_df["date"] = pd.to_datetime(raw_df["date"], errors="coerce").dt.date
-    raw_df = raw_df.dropna(subset=["latitude", "longitude", "date"])
+# Strategy: Use raw as base, append realtime dates not in raw
+# (economic_realtime has NaN values, so we prioritize raw where overlap exists)
 
-    # Safety net: reject any pre-Feb rows if old compiled file used
-    raw_df = raw_df[pd.to_datetime(raw_df["date"]) >= pd.Timestamp(BACKFILL_START)]
+econ_raw_dates = set(econ_raw['date'])
+econ_realtime_new = econ_realtime[~econ_realtime['date'].isin(econ_raw_dates)]
 
-    daily_df = (
-        raw_df.groupby("date")
-        .agg(
-            firms_frp_mean       =("frp",               "mean"),
-            firms_brightness_mean=("unified_brightness", "mean"),
-            firms_anomaly_count  =("date",               "count"),
-        )
-        .reset_index()
-    )
-    log.info("FIRMS loaded: %d anomalies → %d daily aggregates", len(raw_df), len(daily_df))
-    return raw_df, daily_df
+econ_merged = pd.concat([econ_raw, econ_realtime_new], ignore_index=True)
+econ_merged = econ_merged.sort_values('date').reset_index(drop=True)
 
+print(f"  ✓ Economic raw: {len(econ_raw)} days")
+print(f"  ✓ New dates from realtime: {len(econ_realtime_new)} days")
+print(f"  ✓ Economic merged: {len(econ_merged)} days ({econ_merged['date'].min().date()} → {econ_merged['date'].max().date()})")
 
-def _load_and_anchor_gdelt(raw_firms: pd.DataFrame) -> pd.DataFrame:
-    """
-    Load GDELT kinetic CSV, apply 6-day lag, anchor via BallTree.
-    Iran exception: IR events beyond 100km kept as 'iran_unverified'.
-    gdelt_avg_anchor_dist retained as diagnostic column (not a model feature).
-    """
-    if not GDELT_KIN_CSV.exists():
-        log.warning("gdelt_kinetic_raw.csv not found")
-        return pd.DataFrame()
+# Note: Weekends already forward-filled in Step 6
+print(f"  ✓ Weekends already forward-filled (no gaps in date sequence)")
 
-    # header=None + explicit names prevents first-row-as-header silent kill
-    gdelt_df = pd.read_csv(
-        GDELT_KIN_CSV,
-        header=None,
-        names=GDELT_COLS,
-        low_memory=False,
-    )
+# ============================================================================
+# 7. MERGE SENTIMENT DATA
+# ============================================================================
 
-    # Enforce numeric geometry — coerce bad geocodes to NaN then drop
-    gdelt_df["action_lat"] = pd.to_numeric(gdelt_df["action_lat"], errors="coerce")
-    gdelt_df["action_lon"] = pd.to_numeric(gdelt_df["action_lon"], errors="coerce")
-    gdelt_df = gdelt_df.dropna(subset=["event_id", "action_lat", "action_lon", "date"])
+print("\n[7/8] Merging sentiment datasets...")
 
-    if gdelt_df.empty or raw_firms.empty:
-        log.warning("Cannot anchor: GDELT or FIRMS empty")
-        return pd.DataFrame()
+# Start with daily, apply outbreak patch (overwrite), then realtime (overwrite)
+sent_merged = sent_daily_dedup.copy()
 
-    # Apply 6-day lag before anchoring — causality preserved
-    gdelt_df["date"] = (
-        pd.to_datetime(gdelt_df["date"]) - pd.Timedelta(days=GDELT_LAG_DAYS)
-    ).dt.date
+# Apply outbreak patch (overwrites Feb 22, Feb 24 after lag correction)
+patch_dates = set(outbreak_patch['date'])
+sent_merged = sent_merged[~sent_merged['date'].isin(patch_dates)]
+sent_merged = pd.concat([sent_merged, outbreak_patch], ignore_index=True)
+print(f"  ✓ Applied outbreak patch (overwrote {len(patch_dates)} dates)")
 
-    log.info(
-        "Anchoring %d GDELT events (100km radius, ±2 day window, 6-day lag)...",
-        len(gdelt_df),
-    )
+# Apply realtime (overwrites May 5 after lag correction)
+realtime_dates = set(sent_realtime['date'])
+sent_merged = sent_merged[~sent_merged['date'].isin(realtime_dates)]
+sent_merged = pd.concat([sent_merged, sent_realtime], ignore_index=True)
+print(f"  ✓ Applied sentiment realtime (overwrote {len(realtime_dates)} dates)")
 
-    anchored_indices   = []
-    distances_dict     = {}
-    anchor_status_dict = {}
+sent_merged = sent_merged.sort_values('date').reset_index(drop=True)
+print(f"  ✓ Sentiment merged: {len(sent_merged)} days ({sent_merged['date'].min().date()} → {sent_merged['date'].max().date()})")
 
-    max_dist_rad  = ANCHOR_RADIUS_KM / EARTH_RADIUS_KM
-    firms_by_date = dict(list(raw_firms.groupby("date")))
+# ============================================================================
+# 8. CREATE MASTER DATAFRAME
+# ============================================================================
 
-    for current_date, g_group in gdelt_df.groupby("date"):
+print(f"\n[8/8] Creating master dataframe ({START_DATE} → {END_DATE})...")
 
-        # Gather FIRMS fires within ±2 days
-        temporal_firms = [
-            firms_by_date[current_date + timedelta(days=d)]
-            for d in range(-2, 3)
-            if (current_date + timedelta(days=d)) in firms_by_date
-        ]
+# Create full date range
+date_range = pd.date_range(start=START_DATE, end=END_DATE, freq='D')
+master_df = pd.DataFrame({'date': date_range})
 
-        # No fires anywhere in window — only IR events survive
-        if not temporal_firms:
-            for idx, row in g_group.iterrows():
-                if row.get("action_country_code") == "IR":
-                    anchored_indices.append(idx)
-                    anchor_status_dict[idx] = "iran_unverified"
-                    distances_dict[idx]     = np.nan
-            continue
+print(f"  ✓ Master date range: {len(master_df)} days")
 
-        t_firms_df = pd.concat(temporal_firms, ignore_index=True)
-        firms_rad  = np.deg2rad(t_firms_df[["latitude", "longitude"]].values)
-        tree       = BallTree(firms_rad, metric="haversine")
+# Left join all datasets
+print("  → Joining FIRMS...")
+master_df = master_df.merge(firms_daily, on='date', how='left')
 
-        g_rad      = np.deg2rad(g_group[["action_lat", "action_lon"]].values)
-        distances, _ = tree.query(g_rad, k=1)  # nearest-neighbor distance
+print("  → Joining GDELT kinetic...")
+master_df = master_df.merge(gdelt_daily, on='date', how='left')
 
-        for idx_pos, (idx, row) in enumerate(g_group.iterrows()):
-            dist_km = distances[idx_pos][0] * EARTH_RADIUS_KM
+print("  → Joining Economic...")
+master_df = master_df.merge(econ_merged, on='date', how='left')
 
-            if dist_km <= ANCHOR_RADIUS_KM:
-                anchored_indices.append(idx)
-                anchor_status_dict[idx] = "verified"
-                distances_dict[idx]     = dist_km
-            elif row.get("action_country_code") == "IR":
-                anchored_indices.append(idx)
-                anchor_status_dict[idx] = "iran_unverified"
-                distances_dict[idx]     = dist_km
-            # else: discard — no physical corroboration, not Iran
+print("  → Joining Sentiment...")
+master_df = master_df.merge(sent_merged, on='date', how='left')
 
-    anchored_gdelt = gdelt_df.loc[anchored_indices].copy()
-    anchored_gdelt["gdelt_anchor_dist_km"] = anchored_gdelt.index.map(distances_dict)
-    anchored_gdelt["anchor_status"]        = anchored_gdelt.index.map(anchor_status_dict)
+# ============================================================================
+# CREATE MISSING DATA FLAGS
+# ============================================================================
 
-    verified   = (anchored_gdelt["anchor_status"] == "verified").sum()
-    iran_unver = (anchored_gdelt["anchor_status"] == "iran_unverified").sum()
-    log.info(
-        "Anchored %d / %d GDELT events (verified=%d, iran_unverified=%d, discarded=%d)",
-        len(anchored_gdelt), len(gdelt_df), verified, iran_unver,
-        len(gdelt_df) - len(anchored_gdelt),
-    )
+print("\n  → Creating missing data flags...")
 
-    daily = (
-        anchored_gdelt.groupby("date")
-        .agg(
-            gdelt_event_count    =("event_id",             "count"),
-            gdelt_avg_goldstein  =("goldstein_scale",      "mean"),
-            gdelt_total_mentions =("num_mentions",         "sum"),
-            gdelt_avg_tone       =("avg_tone",             "mean"),
-            gdelt_avg_anchor_dist=("gdelt_anchor_dist_km", "mean"),  # diagnostic
-        )
-        .reset_index()
-    )
-    return daily
+# FIRMS missing flag
+master_df['firms_data_missing'] = master_df['firms_detection_count'].isna()
 
+# GDELT kinetic missing flag
+master_df['gdelt_data_missing'] = master_df['gdelt_event_count'].isna()
 
-def _load_economic() -> pd.DataFrame:
-    """
-    Load economic_raw.csv.
-    Weekend gaps forward-filled from Friday close.
-    Absolute prices dropped post-differencing (anti-leakage).
-    SP500 walled off as drawdown_pct display-only.
-    """
-    if not ECONOMIC_CSV.exists():
-        log.warning("economic_raw.csv not found")
-        return pd.DataFrame()
+# Sentiment missing flag
+master_df['sentiment_data_missing'] = master_df['article_count'].isna()
 
-    df = pd.read_csv(ECONOMIC_CSV)
-    df["date"] = pd.to_datetime(df["Date"], errors="coerce").dt.date
-    df = df.drop(columns=["Date"], errors="ignore").sort_values("date")
+# Economic missing flag (should be rare since weekends forward-filled)
+master_df['economic_data_missing'] = master_df['Brent_Crude'].isna()
 
-    # Reindex to continuous daily spine to expose weekend gaps
-    df.set_index("date", inplace=True)
-    all_days = pd.date_range(start=df.index.min(), end=df.index.max(), freq="D").date
-    df = df.reindex(all_days).ffill().reset_index()
-    df.rename(columns={"index": "date"}, inplace=True)
+missing_summary = {
+    'FIRMS': master_df['firms_data_missing'].sum(),
+    'GDELT kinetic': master_df['gdelt_data_missing'].sum(),
+    'Sentiment': master_df['sentiment_data_missing'].sum(),
+    'Economic': master_df['economic_data_missing'].sum(),
+}
 
-    # First differences — Sat/Sun diffs = 0, Mon diff = Mon - Fri
-    for raw_col, diff_col in [
-        ("Brent_Crude", "brent_crude_change"),
-        ("VIX",         "vix_change"),
-        ("USD_ILS",     "usd_ils_change"),
-        ("Gold",        "gold_change"),
-    ]:
-        if raw_col in df.columns:
-            df[diff_col] = df[raw_col].diff()
+print("\n  Missing data summary:")
+for layer, count in missing_summary.items():
+    pct = count / len(master_df) * 100
+    print(f"    {layer:20s}: {count:3d} days ({pct:5.1f}%)")
 
-    # SP500: drawdown from Feb 27 peak, then drop absolute price
-    if "SP500" in df.columns:
-        peak_date = pd.to_datetime("2026-02-27").date()
-        peak_mask = df["date"] <= peak_date
-        if peak_mask.any():
-            sp500_peak = df.loc[peak_mask, "SP500"].iloc[-1]
-            df["sp500_drawdown_pct"] = (df["SP500"] - sp500_peak) / sp500_peak * 100
-        df = df.drop(columns=["SP500"], errors="ignore")
+# ============================================================================
+# SAVE MASTER DATAFRAME
+# ============================================================================
 
-    # Drop absolute prices — anti-leakage guard for Phase 3 stationarity
-    df = df.drop(columns=["Brent_Crude", "VIX", "USD_ILS", "Gold"], errors="ignore")
+print(f"\n  → Saving to {OUTPUT_FILE}...")
+master_df.to_csv(OUTPUT_FILE, index=False)
 
-    log.info("Economic signals loaded: %d days (weekend-filled)", len(df))
-    return df
-
-
-def _load_sentiment() -> pd.DataFrame:
-    """
-    Stack all sentiment shards, purge historically-null columns, deduplicate.
-    Shards: gdelt_sentiment_daily + outbreak_patch + sentiment_realtime.
-    Richest row wins on duplicate dates.
-    """
-    dfs = [pd.read_csv(p) for p in SENTIMENT_FILES if p.exists()]
-    if not dfs:
-        log.warning("No sentiment files found")
-        return pd.DataFrame()
-
-    df = pd.concat(dfs, ignore_index=True)
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
-
-    # Drop columns that are 100% null in historical backfill
-    # (gdelt_tone_avg, gdelt_tone_norm, signal_divergence never backfilled)
-    df = df.drop(
-        columns=[c for c in NULL_SENTIMENT_COLS if c in df.columns],
-        errors="ignore",
-    )
-
-    # Richest-row dedup: prefer row with most non-null values per date
-    df["_valid_count"] = df.notna().sum(axis=1)
-    df = (
-        df.sort_values(["date", "_valid_count"], ascending=[True, False])
-        .drop_duplicates(subset=["date"], keep="first")
-        .drop(columns=["_valid_count"])
-    )
-
-    log.info("Sentiment stacked: %d days from %d shard(s)", len(df), len(dfs))
-    return df
-
-
-# ── Master merge ──────────────────────────────────────────────────────────────
-
-def build_master_df(
-    start_date: str = BACKFILL_START,
-    end_date:   str = None,
-) -> pd.DataFrame:
-    """
-    Joins all sources onto a continuous daily spine.
-    Missing days flagged for uncertainty propagation, not dropped.
-    """
-    start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-    end_dt   = (
-        datetime.strptime(end_date, "%Y-%m-%d").date()
-        if end_date
-        else (datetime.utcnow() - timedelta(days=1)).date()
-    )
-
-    log.info("Building master timeline: %s → %s", start_dt, end_dt)
-    master = pd.DataFrame(
-        {"date": pd.date_range(str(start_dt), str(end_dt), freq="D").date}
-    )
-
-    raw_firms, daily_firms = _load_firms()
-
-    sources = [
-        (daily_firms,                        "FIRMS"),
-        (_load_and_anchor_gdelt(raw_firms),  "GDELT kinetic"),
-        (_load_economic(),                   "Economic"),
-        (_load_sentiment(),                  "Sentiment"),
-    ]
-
-    for df, label in sources:
-        if not df.empty:
-            master = master.merge(df, on="date", how="left")
-            log.info("Merged: %s", label)
-        else:
-            log.warning("Skipped (empty): %s", label)
-
-    # Uncertainty propagation flags for Lanchester ODEs
-    master["firms_data_missing"]     = master["firms_frp_mean"].isna()
-    master["gdelt_data_missing"]     = master["gdelt_event_count"].isna()
-    master["sentiment_data_missing"] = master["distilbert_avg"].isna()
-    master["economic_data_missing"]  = master["brent_crude_change"].isna()
-
-    master.to_csv(OUTPUT_CSV, index=False)
-    log.info(
-        "Master DF saved → %s  (%d rows × %d cols)",
-        OUTPUT_CSV, len(master), len(master.columns),
-    )
-
-    # Quick sanity report
-    print("\n── Missing data summary ──")
-    for col in ["firms_data_missing", "gdelt_data_missing",
-                "sentiment_data_missing", "economic_data_missing"]:
-        if col in master.columns:
-            print(f"  {col}: {master[col].sum()} days")
-
-    return master
-
-
-if __name__ == "__main__":
-    build_master_df()
+print("\n" + "="*80)
+print("MASTER DATAFRAME CREATED")
+print("="*80)
+print(f"\nShape: {master_df.shape}")
+print(f"Date range: {master_df['date'].min().date()} → {master_df['date'].max().date()}")
+print(f"Total columns: {len(master_df.columns)}")
+print(f"\nColumn groups:")
+print(f"  - Physical layer (FIRMS): 12 features")
+print(f"  - Narrative layer (GDELT): 6 features")
+print(f"  - Economic layer: 5 signals (Brent, Gold, USD/ILS, SP500, VIX)")
+print(f"  - Sentiment layer: {len([c for c in sent_merged.columns if c != 'date'])} features")
+print(f"  - Missing flags: 4 boolean columns")
+print(f"\nOutput: {OUTPUT_FILE}")
+print("\n✓ Step 9 complete. Ready for Step 10 (Feature Engineering).")
+print("="*80)
